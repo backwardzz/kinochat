@@ -6,6 +6,7 @@ import '../main.dart';
 import '../models.dart';
 import '../services/link_parser.dart';
 import '../services/search.dart';
+import '../services/tmdb.dart';
 import '../theme.dart';
 import 'sources_screen.dart';
 
@@ -26,6 +27,11 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
   bool _searching = false;
   String? _error;
   CombinedResults? _found;
+
+  /// Films from the catalogue for the same query, and the one opened.
+  List<Film> _films = const [];
+  Film? _film;
+  bool _trailerLoading = false;
 
   SearchService get _search => ServicesScope.of(context).search;
 
@@ -53,20 +59,73 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
     Navigator.of(context).pop(source);
   }
 
-  Future<void> _runSearch() async {
+  /// Videos from every source and, unless [films] is off, films from the
+  /// catalogue, both for the text in the search field.
+  Future<void> _runSearch({bool films = true}) async {
     final query = _query.text.trim();
     if (query.isEmpty || _searching) return;
     FocusScope.of(context).unfocus();
     setState(() {
       _searching = true;
       _error = null;
+      _film = null;
     });
-    final found = await _search.searchAll(query);
+    final tmdb = films ? _search.tmdb : null;
+    String? catalogFailure;
+    final videos = _search.searchAll(query);
+    final catalog = tmdb == null
+        ? Future.value(const <Film>[])
+        : tmdb.search(query).catchError((Object e) {
+            catalogFailure = e is SearchException
+                ? e.message
+                : 'Не удалось разобрать ответ.';
+            return const <Film>[];
+          });
+    final found = await videos;
+    final foundFilms = await catalog;
     if (!mounted) return;
     setState(() {
-      _found = found;
+      _found = CombinedResults(
+        results: found.results,
+        searched: found.searched,
+        failures: {...found.failures, 'TMDB': ?catalogFailure},
+      );
+      _films = foundFilms;
       _searching = false;
     });
+  }
+
+  Future<void> _watchTrailer(Film film) async {
+    final tmdb = _search.tmdb;
+    if (tmdb == null || _trailerLoading) return;
+    setState(() {
+      _trailerLoading = true;
+      _error = null;
+    });
+    try {
+      final key = await tmdb.trailerKey(film);
+      if (!mounted) return;
+      if (key == null) {
+        setState(() => _error = 'У этого фильма в каталоге нет трейлера.');
+        return;
+      }
+      Navigator.of(context).pop(
+        parseVideoLink(
+          'https://www.youtube.com/watch?v=$key',
+          title: '${film.title} — трейлер',
+        ),
+      );
+    } on SearchException catch (e) {
+      if (mounted) setState(() => _error = e.message);
+    } finally {
+      if (mounted) setState(() => _trailerLoading = false);
+    }
+  }
+
+  /// Looks for the film itself in the video sources.
+  void _findFilm(Film film) {
+    _query.text = film.title;
+    _runSearch(films: false);
   }
 
   void _pick(SearchResult result) {
@@ -99,6 +158,7 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
             listenable: _search,
             builder: (context, _) {
               final sources = _search.sources;
+              final videoSources = _search.videoSources;
               final active = [
                 for (final s in sources)
                   if (s.usableHere) s.name,
@@ -107,6 +167,7 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
                 for (final s in sources)
                   if (!s.usableHere) s.name,
               ];
+              final film = _film;
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -179,7 +240,19 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
                       ),
                     ),
                   Expanded(
-                    child: _found == null
+                    child: film != null
+                        ? _FilmCard(
+                            film: film,
+                            trailerLoading: _trailerLoading,
+                            canSearch: videoSources.isNotEmpty,
+                            onTrailer: () => _watchTrailer(film),
+                            onFind: () => _findFilm(film),
+                            onBack: () => setState(() {
+                              _film = null;
+                              _error = null;
+                            }),
+                          )
+                        : _found == null
                         ? _LinkEntry(
                             controller: _link,
                             detected: detected,
@@ -189,8 +262,16 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
                           )
                         : _Results(
                             found: _found!,
+                            films: _films,
                             onPick: _pick,
-                            onBack: () => setState(() => _found = null),
+                            onFilm: (f) => setState(() {
+                              _film = f;
+                              _error = null;
+                            }),
+                            onBack: () => setState(() {
+                              _found = null;
+                              _films = const [];
+                            }),
                           ),
                   ),
                 ],
@@ -291,12 +372,16 @@ class _LinkEntry extends StatelessWidget {
 class _Results extends StatelessWidget {
   const _Results({
     required this.found,
+    required this.films,
     required this.onPick,
+    required this.onFilm,
     required this.onBack,
   });
 
   final CombinedResults found;
+  final List<Film> films;
   final ValueChanged<SearchResult> onPick;
+  final ValueChanged<Film> onFilm;
   final VoidCallback onBack;
 
   @override
@@ -320,9 +405,14 @@ class _Results extends StatelessWidget {
                   children: [
                     Expanded(
                       child: Text(
-                        results.isEmpty
+                        results.isEmpty && films.isEmpty
                             ? 'Ничего не нашлось'
-                            : 'Найдено: ${results.length}',
+                            : [
+                                if (films.isNotEmpty)
+                                  'Фильмов в каталоге: ${films.length}',
+                                if (results.isNotEmpty)
+                                  'Видео: ${results.length}',
+                              ].join(' · '),
                         style: const TextStyle(color: kTextDim, fontSize: 13),
                       ),
                     ),
@@ -344,6 +434,27 @@ class _Results extends StatelessWidget {
                       ),
                     ),
                   ),
+                if (films.isNotEmpty) ...[
+                  SizedBox(
+                    height: 222,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.only(top: 4, right: 8),
+                      itemCount: films.length,
+                      separatorBuilder: (_, _) => const SizedBox(width: 10),
+                      itemBuilder: (context, i) =>
+                          _FilmTile(film: films[i], onTap: onFilm),
+                    ),
+                  ),
+                  if (results.isNotEmpty)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 10, bottom: 2),
+                      child: Text(
+                        'Видео',
+                        style: TextStyle(color: kTextDim, fontSize: 13),
+                      ),
+                    ),
+                ],
               ],
             ),
           );
@@ -386,6 +497,187 @@ class _Results extends StatelessWidget {
           onTap: () => onPick(r),
         );
       },
+    );
+  }
+}
+
+/// Poster of a catalogue film with its title underneath.
+class _FilmTile extends StatelessWidget {
+  const _FilmTile({required this.film, required this.onTap});
+
+  final Film film;
+  final ValueChanged<Film> onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 112,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: () => onTap(film),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _Poster(url: film.poster, width: 112, height: 168),
+            const SizedBox(height: 6),
+            Text(
+              film.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12.5, height: 1.2),
+            ),
+            if (film.year != null)
+              Text(
+                film.year!,
+                style: const TextStyle(color: kTextDim, fontSize: 11.5),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _Poster extends StatelessWidget {
+  const _Poster({required this.url, required this.width, required this.height});
+
+  final String? url;
+  final double width;
+  final double height;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: SizedBox(
+        width: width,
+        height: height,
+        child: url == null
+            ? const _NoPoster()
+            : Image.network(
+                url!,
+                fit: BoxFit.cover,
+                webHtmlElementStrategy: WebHtmlElementStrategy.fallback,
+                errorBuilder: (_, _, _) => const _NoPoster(),
+              ),
+      ),
+    );
+  }
+}
+
+/// What the catalogue knows about a film, and the two things to do with it:
+/// watch the trailer together, or look for the film in the video sources.
+class _FilmCard extends StatelessWidget {
+  const _FilmCard({
+    required this.film,
+    required this.trailerLoading,
+    required this.canSearch,
+    required this.onTrailer,
+    required this.onFind,
+    required this.onBack,
+  });
+
+  final Film film;
+  final bool trailerLoading;
+
+  /// Whether any video source is connected to look the film up in.
+  final bool canSearch;
+  final VoidCallback onTrailer;
+  final VoidCallback onFind;
+  final VoidCallback onBack;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final facts = [
+      ?film.year,
+      if (film.isSeries) 'сериал',
+      if (film.rating != null) '★ ${film.rating!.toStringAsFixed(1)}',
+    ].join(' · ');
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 16),
+      children: [
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
+            onPressed: onBack,
+            icon: const Icon(Icons.arrow_back_rounded, size: 18),
+            label: const Text('К результатам'),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _Poster(url: film.poster, width: 112, height: 168),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    film.title,
+                    style: text.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  if (facts.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text(
+                        facts,
+                        style: const TextStyle(color: kTextDim, fontSize: 13),
+                      ),
+                    ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: trailerLoading ? null : onTrailer,
+                    icon: trailerLoading
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.play_arrow_rounded),
+                    label: const Text('Смотреть трейлер'),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: canSearch ? onFind : null,
+                    icon: const Icon(Icons.search_rounded, size: 18),
+                    label: const Text('Найти в источниках'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        if (!canSearch)
+          const Padding(
+            padding: EdgeInsets.only(top: 10),
+            child: Text(
+              'Чтобы искать сам фильм, подключите источник видео на экране '
+              '«Источники».',
+              style: TextStyle(color: kTextDim, fontSize: 12.5, height: 1.35),
+            ),
+          ),
+        if (film.overview.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 14),
+            child: Text(
+              film.overview,
+              style: const TextStyle(fontSize: 14, height: 1.45),
+            ),
+          ),
+        const Padding(
+          padding: EdgeInsets.only(top: 16),
+          child: Text(
+            tmdbNotice,
+            style: TextStyle(color: kTextDim, fontSize: 11.5, height: 1.35),
+          ),
+        ),
+      ],
     );
   }
 }

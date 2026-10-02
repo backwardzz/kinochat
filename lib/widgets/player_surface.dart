@@ -18,12 +18,17 @@ class SurfaceActions {
     required this.onAddVideo,
     required this.onToggleChat,
     required this.onBack,
+    this.rightInset = 0,
   });
 
   /// Phone held sideways: the video fills the screen, so it carries the back
   /// and chat buttons itself.
   final bool immersive;
   final bool chatOpen;
+
+  /// Width on the right taken by the chat floating over the video; buttons
+  /// and the seek bar keep out of it.
+  final double rightInset;
   final VoidCallback onAddVideo;
   final VoidCallback onToggleChat;
   final VoidCallback onBack;
@@ -223,7 +228,7 @@ class _EmptyState extends StatelessWidget {
           Positioned(
             top: 2,
             left: 4,
-            right: 4,
+            right: 4 + actions.rightInset,
             child: _TopRow(actions: actions, label: '', changeVideo: false),
           ),
       ],
@@ -292,6 +297,7 @@ class _ControlsState extends State<_Controls> {
   Widget build(BuildContext context) {
     final c = widget.controller;
     final status = c.player.status;
+    final inset = widget.actions.rightInset;
     final ended = status.phase == PlayerPhase.ended;
     final playing = c.state.playing && !ended;
     final visible = _visible || !playing;
@@ -346,15 +352,17 @@ class _ControlsState extends State<_Controls> {
                       Positioned(
                         top: 2,
                         left: 4,
-                        right: 4,
+                        right: 4 + inset,
                         child: _TopRow(
                           actions: widget.actions,
                           label: c.title ?? c.source?.label ?? '',
                         ),
                       ),
                       // centre: back 10 s, play/pause, forward 10 s
-                      Center(
+                      Positioned.fill(
+                        right: inset,
                         child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             IconButton(
@@ -411,7 +419,7 @@ class _ControlsState extends State<_Controls> {
                       // bottom: time and seek bar
                       Positioned(
                         left: 12,
-                        right: 12,
+                        right: 12 + inset,
                         bottom: 2,
                         child: Row(
                           children: [
@@ -480,7 +488,7 @@ class _EmbedBar extends StatelessWidget {
         child: ColoredBox(
           color: const Color(0xE6000000),
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 4),
+            padding: EdgeInsets.only(left: 4, right: 4 + actions.rightInset),
             child: _TopRow(
               actions: actions,
               label: 'Страница без синхронизации: каждый запускает видео сам',
@@ -561,7 +569,7 @@ class _ErrorPanel extends StatelessWidget {
               Positioned(
                 top: 2,
                 left: 4,
-                right: 4,
+                right: 4 + actions.rightInset,
                 child: _TopRow(actions: actions, label: '', changeVideo: false),
               ),
           ],

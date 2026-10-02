@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import 'prefs.dart';
+import 'tmdb.dart';
 
 /// A search API described by data, so that any JSON API can be plugged in
 /// without changing the app: where to send the query and where in the answer
@@ -24,6 +25,7 @@ class SearchSource {
     this.builtIn = false,
     this.keyHint = '',
     this.webBlocked = false,
+    this.catalog = false,
   });
 
   final String id;
@@ -54,6 +56,10 @@ class SearchSource {
 
   /// The service does not answer requests made from a web page.
   final bool webBlocked;
+
+  /// A catalogue of films (TMDB): it describes them but gives no video
+  /// links, so it is asked separately from the video search.
+  final bool catalog;
 
   bool get needsKey => urlTemplate.contains('{key}') || _headersNeedKey;
   bool get _headersNeedKey => headers.values.any((v) => v.contains('{key}'));
@@ -88,6 +94,7 @@ class SearchSource {
     builtIn: builtIn,
     keyHint: keyHint,
     webBlocked: webBlocked,
+    catalog: catalog,
   );
 
   Map<String, dynamic> toJson() => {
@@ -213,6 +220,21 @@ const _builtIn = <SearchSource>[
         '→ создать приложение → получить токен пользователя.',
     webBlocked: true,
   ),
+  SearchSource(
+    id: 'tmdb',
+    name: 'TMDB',
+    urlTemplate: 'https://api.themoviedb.org/3/search/multi?api_key={key}',
+    listPath: 'results',
+    titlePath: 'title',
+    linkPath: '',
+    builtIn: true,
+    catalog: true,
+    keyHint:
+        'Каталог фильмов и сериалов: описания, постеры, рейтинги, трейлеры. '
+        'Самих фильмов в нём нет. Бесплатный ключ: themoviedb.org → '
+        'зарегистрироваться → Settings → API → Create. Подойдёт и «API Key», '
+        'и «API Read Access Token».',
+  ),
 ];
 
 /// Built-in and user-defined sources, and running a search through one.
@@ -283,9 +305,21 @@ class SearchService extends ChangeNotifier {
   Future<List<SearchResult>> search(SearchSource source, String query) async =>
       parseResults(source, await fetch(source, query));
 
-  /// Asks every source that can be used here, all at once.
+  /// The film catalogue, when its key is set.
+  Tmdb? get tmdb {
+    final key = _builtInKeys['tmdb'] ?? '';
+    return key.isEmpty ? null : Tmdb(key);
+  }
+
+  /// Sources that return videos and can be used here.
+  List<SearchSource> get videoSources => [
+    for (final s in sources)
+      if (s.usableHere && !s.catalog) s,
+  ];
+
+  /// Asks every video source that can be used here, all at once.
   Future<CombinedResults> searchAll(String query) async {
-    final usable = sources.where((s) => s.usableHere).toList();
+    final usable = videoSources;
     final failures = <String, String>{};
     final lists = await Future.wait([
       for (final s in usable)

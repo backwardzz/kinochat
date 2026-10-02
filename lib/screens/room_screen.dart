@@ -253,6 +253,7 @@ class _RoomScreenState extends State<RoomScreen> {
               actions: SurfaceActions(
                 immersive: immersive,
                 chatOpen: _chatOpen,
+                rightInset: immersive && _chatOpen ? size.width - chat.left : 0,
                 onAddVideo: _addVideo,
                 onToggleChat: () => setState(() {
                   _chatOpen = !_chatOpen;

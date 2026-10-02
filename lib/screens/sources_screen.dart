@@ -6,6 +6,7 @@ import '../models.dart';
 import '../services/detect.dart';
 import '../services/link_parser.dart';
 import '../services/search.dart';
+import '../services/tmdb.dart';
 import '../theme.dart';
 
 /// Search sources: the built-in ones and any API the user plugs in.
@@ -77,6 +78,8 @@ class _SourceTile extends StatelessWidget {
       status = 'Не участвует в поиске: нужен ключ API';
     } else if (kIsWeb && source.webBlocked) {
       status = 'Работает в приложении для Android, в браузере — нет';
+    } else if (source.catalog) {
+      status = 'Каталог фильмов: описания, постеры, трейлеры';
     } else {
       status = source.builtIn ? 'Встроенный' : 'Свой API';
     }
@@ -241,6 +244,24 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
       _outcome = null;
     });
     try {
+      if (source.catalog) {
+        final films = await Tmdb(source.apiKey).search(query);
+        if (films.isEmpty) {
+          _show(
+            'Ключ принят, но по запросу «$query» в каталоге ничего нет. '
+            'Попробуйте другой запрос для проверки.',
+          );
+          return false;
+        }
+        final first = films.first;
+        _show(
+          'Работает, найдено: ${films.length}\n'
+          '${first.title}${first.year == null ? '' : ' (${first.year})'}',
+          ok: true,
+        );
+        return true;
+      }
+
       final json = await search.fetch(source, query);
       if (!mounted) return false;
 
@@ -378,7 +399,8 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
                     ),
                   if (needsKey) ...[
                     _Note(initial!.keyHint),
-                    _field(_key, 'Ключ API', mono: true),
+                    _field(_key, 'Ключ API', mono: true, lines: 4),
+                    if (initial.catalog) const _Note(tmdbNotice),
                   ] else
                     const _Note('Ключ не нужен, источник готов к работе.'),
                 ] else ...[
