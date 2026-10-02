@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>player</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #stage { position: absolute; inset: 0; }
+  #stage > * { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
+  video { object-fit: contain; }
+  #unlock {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    border: 0; margin: 0; padding: 16px; width: 100%; height: 100%;
+    background: rgba(0, 0, 0, .6); color: #fff;
+    font: 600 16px/1.3 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent; cursor: pointer;
+  }
+  #unlock span { background: #e5484d; padding: 12px 20px; border-radius: 999px; }
+  #hint {
+    position: absolute; left: 50%; top: 10px; transform: translateX(-50%); display: none;
+    pointer-events: none; white-space: nowrap; background: rgba(0, 0, 0, .75); color: #fff;
+    padding: 8px 14px; border-radius: 999px;
+    font: 600 13px/1.2 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<button id="unlock" type="button"><span>▶ Нажмите, чтобы начать просмотр</span></button>
+<div id="hint">Нажмите ▶ на самом видео</div>
+<script>
+(function () {
+  'use strict';
+
+  // One page plays every kind of source and speaks one small protocol:
+  //   in:  {cmd: 'load' | 'play' | 'pause' | 'seek' | 'stop', ...}
+  //   out: {ev: 'ready' | 'state' | 'error', ...}
+  // In the browser it sits in an iframe and uses postMessage; in the Android
+  // and iOS apps it runs in a WebView and uses the `KC` JavaScript channel.
+
+  var token = (location.hash || '').replace(/^#/, '');
+  var stage = document.getElementById('stage');
+  var unlockBtn = document.getElementById('unlock');
+  var hint = document.getElementById('hint');
+
+  var cur = null;        // active adapter
+  var kind = null;
+  var seq = 0;           // bumps on every load, stale callbacks check it
+  var wantPlaying = false;
+  var pausedSince = 0;   // when playback that should run was first seen paused
+  var blocked = false;
+  var unlockTried = false; // our button was pressed for this video
+  var tapPlayer = false;   // it did not help, the player itself needs a tap
+  var lastError = null;
+
+  function send(o) {
+    o.kc = 1;
+    o.tok = token;
+    var s = JSON.stringify(o);
+    try {
+      if (window.KC && window.KC.postMessage) window.KC.postMessage(s);
+      else if (window.parent !== window) window.parent.postMessage(s, '*');
+    } catch (e) {}
+  }
+
+  function loadScript(src, done) {
+    var s = document.createElement('script');
+    s.src = src;
+    s.onload = function () { done(true); };
+    s.onerror = function () { done(false); };
+    document.head.appendChild(s);
+  }
+
+  function fail(msg) {
+    lastError = msg;
+    send({ ev: 'error', msg: msg });
+  }
+
+  // ---- direct file: mp4 / webm / m3u8 ------------------------------------
+
+  function fileAdapter(url, start, autoplay, mySeq) {
+    var v = document.createElement('video');
+    v.setAttribute('playsinline', '');
+    v.setAttribute('webkit-playsinline', '');
+    v.preload = 'auto';
+    stage.appendChild(v);
+    var hls = null;
+    var denied = false;
+    var started = false;
+
+    v.addEventListener('loadedmetadata', function () {
+      if (started) return;
+      started = true;
+      if (start > 0) { try { v.currentTime = start; } catch (e) {} }
+      if (wantPlaying) api.play();
+    });
+    v.addEventListener('error', function () {
+      if (mySeq !== seq) return;
+      fail('Не удалось открыть видео. Проверьте, что ссылка ведёт прямо на файл и он доступен.');
+    });
+
+    var isHls = /\.m3u8($|[?#])/i.test(url);
+    if (isHls && !v.canPlayType('application/vnd.apple.mpegurl')) {
+      loadScript('https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js', function (ok) {
+        if (mySeq !== seq) return;
+        if (!ok || !window.Hls || !window.Hls.isSupported()) {
+          fail('Этот формат потока здесь не поддерживается.');
+          return;
+        }
+        hls = new window.Hls();
+        hls.on(window.Hls.Events.ERROR, function (_, data) {
+          if (data && data.fatal && mySeq === seq) fail('Не удалось загрузить поток.');
+        });
+        hls.loadSource(url);
+        hls.attachMedia(v);
+      });
+    } else {
+      v.src = url;
+    }
+
+    var api = {
+      needsButton: true,
+      play: function () {
+        var p = v.play();
+        if (p && p.then) {
+          p.then(function () { denied = false; }).catch(function (e) {
+            if (e && e.name === 'NotAllowedError') denied = true;
+          });
+        }
+      },
+      pause: function () { v.pause(); },
+      seek: function (t) { try { v.currentTime = t; } catch (e) {} },
+      time: function () { return v.currentTime || 0; },
+      duration: function () { return isFinite(v.duration) ? v.duration : 0; },
+      state: function () {
+        if (v.ended) return 'ended';
+        if (v.paused) return 'paused';
+        return v.readyState < 3 ? 'buffering' : 'playing';
+      },
+      denied: function () { return denied; },
+      destroy: function () {
+        try { v.pause(); } catch (e) {}
+        if (hls) { try { hls.destroy(); } catch (e) {} }
+        v.removeAttribute('src');
+        try { v.load(); } catch (e) {}
+      }
+    };
+    return api;
+  }
+
+  // ---- YouTube -----------------------------------------------------------
+
+  var ytWaiters = null;
+  function ensureYT(done) {
+    if (window.YT && window.YT.Player) { done(true); return; }
+    if (ytWaiters) { ytWaiters.push(done); return; }
+    ytWaiters = [done];
+    window.onYouTubeIframeAPIReady = function () {
+      var w = ytWaiters; ytWaiters = null;
+      w.forEach(function (f) { f(true); });
+    };
+    loadScript('https://www.youtube.com/iframe_api', function (ok) {
+      if (!ok) { var w = ytWaiters; ytWaiters = null; w.forEach(function (f) { f(false); }); }
+    });
+  }
+
+  var ytErrors = {
+    2: 'Неверная ссылка на видео YouTube.',
+    5: 'YouTube не смог воспроизвести это видео.',
+    100: 'Видео на YouTube удалено или закрыто.',
+    101: 'Автор запретил показывать это видео вне YouTube.',
+    150: 'Автор запретил показывать это видео вне YouTube.',
+    153: 'YouTube отклонил запрос плеера.'
+  };
+
+  function youtubeAdapter(id, start, autoplay, mySeq) {
+    var p = null;
+    var ready = false;
+    var builds = 0;
+
+    function build(controls, from) {
+      var holder = document.createElement('div');
+      holder.id = 'yt' + mySeq + '_' + (builds++);
+      stage.appendChild(holder);
+      p = new window.YT.Player(holder.id, {
+        videoId: id,
+        width: '100%',
+        height: '100%',
+        playerVars: {
+          controls: controls, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3, playsinline: 1,
+          start: Math.floor(from || 0),
+          autoplay: wantPlaying ? 1 : 0,
+          origin: location.origin
+        },
+        events: {
+          onReady: function () {
+            ready = true;
+            if (mySeq === seq && wantPlaying) p.playVideo();
+          },
+          onError: function (e) {
+            if (mySeq === seq) fail(ytErrors[e.data] || 'Ошибка плеера YouTube.');
+          }
+        }
+      });
+    }
+
+    ensureYT(function (ok) {
+      if (mySeq !== seq) return;
+      if (!ok) { fail('Не удалось загрузить плеер YouTube. Проверьте доступ к YouTube.'); return; }
+      build(0, start);
+    });
+
+    return {
+      // Rebuilds the player with YouTube's own play button, for browsers that
+      // only start a video from a tap inside the player.
+      nativeControls: function () {
+        if (!p) return;
+        var from = ready && p.getCurrentTime ? (p.getCurrentTime() || start) : start;
+        ready = false;
+        try { p.destroy(); } catch (e) {}
+        while (stage.firstChild) stage.removeChild(stage.firstChild);
+        build(1, from);
+      },
+      play: function () { if (ready) p.playVideo(); },
+      pause: function () { if (ready) p.pauseVideo(); },
+      seek: function (t) { if (ready) p.seekTo(t, true); },
+      time: function () { return ready && p.getCurrentTime ? (p.getCurrentTime() || 0) : (start || 0); },
+      duration: function () { return ready && p.getDuration ? (p.getDuration() || 0) : 0; },
+      state: function () {
+        if (!ready) return 'buffering';
+        var s = p.getPlayerState();
+        if (s === 1) return 'playing';
+        if (s === 3) return 'buffering';
+        if (s === 0) return 'ended';
+        return 'paused';
+      },
+      title: function () {
+        try { return ready && p.getVideoData ? (p.getVideoData().title || null) : null; } catch (e) { return null; }
+      },
+      destroy: function () { try { if (p && p.destroy) p.destroy(); } catch (e) {} }
+    };
+  }
+
+  // ---- Rutube ------------------------------------------------------------
+
+  function rutubeAdapter(id, start, autoplay, mySeq) {
+    var f = document.createElement('iframe');
+    f.allow = 'autoplay; encrypted-media; fullscreen; picture-in-picture; clipboard-write';
+    f.setAttribute('allowfullscreen', '');
+    f.src = 'https://rutube.ru/play/embed/' + encodeURIComponent(id) +
+      (start > 0 ? '?t=' + Math.floor(start) : '');
+    stage.appendChild(f);
+
+    var st = 'buffering';
+    var t = start || 0;
+    var d = 0;
+    var ready = false;
+
+    function cmd(type, data) {
+      try { f.contentWindow.postMessage(JSON.stringify({ type: type, data: data || {} }), '*'); } catch (e) {}
+    }
+    function onMsg(e) {
+      if (e.source !== f.contentWindow) return;
+      var m;
+      try { m = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch (_) { return; }
+      if (!m || !m.type) return;
+      var data = m.data || {};
+      switch (m.type) {
+        case 'player:ready':
+          ready = true;
+          if (st === 'buffering') st = 'paused';
+          if (wantPlaying) cmd('player:play');
+          break;
+        case 'player:changeState':
+          if (data.state === 'playing') st = 'playing';
+          else if (data.state === 'paused' || data.state === 'stopped') st = 'paused';
+          break;
+        case 'player:currentTime':
+          if (typeof data.time === 'number') t = data.time;
+          break;
+        case 'player:durationChange':
+          if (typeof data.duration === 'number') d = data.duration;
+          break;
+        case 'player:playComplete':
+          st = 'ended';
+          break;
+        case 'player:error':
+          if (mySeq === seq) fail('Rutube не смог воспроизвести это видео.');
+          break;
+      }
+    }
+    window.addEventListener('message', onMsg);
+
+    return {
+      play: function () { if (ready) cmd('player:play'); },
+      pause: function () { if (ready) cmd('player:pause'); },
+      seek: function (x) { if (ready) { t = x; cmd('player:setCurrentTime', { time: x }); } },
+      time: function () { return t; },
+      duration: function () { return d; },
+      state: function () { return st; },
+      destroy: function () { window.removeEventListener('message', onMsg); }
+    };
+  }
+
+  // ---- VK Видео ----------------------------------------------------------
+
+  var vkWaiters = null;
+  function ensureVK(done) {
+    if (window.VK && window.VK.VideoPlayer) { done(true); return; }
+    if (vkWaiters) { vkWaiters.push(done); return; }
+    vkWaiters = [done];
+    loadScript('https://vk.com/js/api/videoplayer.js', function (ok) {
+      var w = vkWaiters; vkWaiters = null;
+      w.forEach(function (f) { f(ok && window.VK && window.VK.VideoPlayer); });
+    });
+  }
+
+  function vkAdapter(ref, start, autoplay, mySeq) {
+    var parts = String(ref).split('_');
+    var f = document.createElement('iframe');
+    f.allow = 'autoplay; encrypted-media; fullscreen; picture-in-picture; screen-wake-lock';
+    f.setAttribute('allowfullscreen', '');
+    f.src = 'https://vk.com/video_ext.php?oid=' + encodeURIComponent(parts[0]) +
+      '&id=' + encodeURIComponent(parts[1]) +
+      (parts[2] ? '&hash=' + encodeURIComponent(parts[2]) : '') +
+      '&hd=2&js_api=1';
+    stage.appendChild(f);
+
+    var p = null;
+    var ready = false;
+    var st = 'buffering';
+
+    ensureVK(function (ok) {
+      if (mySeq !== seq) return;
+      if (!ok) { fail('Не удалось загрузить плеер VK Видео.'); return; }
+      p = window.VK.VideoPlayer(f);
+      p.on('inited', function () {
+        ready = true;
+        st = 'paused';
+        if (start > 0) { try { p.seek(start); } catch (e) {} }
+        if (wantPlaying) { try { p.play(); } catch (e) {} }
+      });
+      p.on('started', function () { st = 'playing'; });
+      p.on('resumed', function () { st = 'playing'; });
+      p.on('paused', function () { st = 'paused'; });
+      p.on('ended', function () { st = 'ended'; });
+      p.on('error', function () { if (mySeq === seq) fail('VK Видео не смог воспроизвести это видео.'); });
+    });
+
+    return {
+      play: function () { if (ready) p.play(); },
+      pause: function () { if (ready) p.pause(); },
+      seek: function (t) { if (ready) p.seek(t); },
+      time: function () { try { return ready ? (p.getCurrentTime() || 0) : (start || 0); } catch (e) { return 0; } },
+      duration: function () { try { return ready ? (p.getDuration() || 0) : 0; } catch (e) { return 0; } },
+      state: function () { return st; },
+      destroy: function () { try { if (p && p.destroy) p.destroy(); } catch (e) {} }
+    };
+  }
+
+  // ---- any other page: shown as is, cannot be controlled -----------------
+
+  function embedAdapter(url) {
+    var f = document.createElement('iframe');
+    f.allow = 'autoplay; encrypted-media; fullscreen; picture-in-picture';
+    f.setAttribute('allowfullscreen', '');
+    f.src = url;
+    stage.appendChild(f);
+    return {
+      play: function () {}, pause: function () {}, seek: function () {},
+      time: function () { return 0; }, duration: function () { return 0; },
+      state: function () { return 'idle'; }, destroy: function () {}
+    };
+  }
+
+  // ---- protocol ----------------------------------------------------------
+
+  function unload() {
+    seq++;
+    if (cur) { try { cur.destroy(); } catch (e) {} }
+    cur = null;
+    kind = null;
+    blocked = false;
+    unlockTried = false;
+    tapPlayer = false;
+    lastError = null;
+    while (stage.firstChild) stage.removeChild(stage.firstChild);
+    showUnlock();
+  }
+
+  function load(m) {
+    unload();
+    kind = m.kind;
+    wantPlaying = !!m.autoplay;
+    pausedSince = 0;
+    var start = Number(m.start) || 0;
+    if (kind === 'youtube') cur = youtubeAdapter(m.ref, start, wantPlaying, seq);
+    else if (kind === 'rutube') cur = rutubeAdapter(m.ref, start, wantPlaying, seq);
+    else if (kind === 'vk') cur = vkAdapter(m.ref, start, wantPlaying, seq);
+    else if (kind === 'file') cur = fileAdapter(m.ref, start, wantPlaying, seq);
+    else cur = embedAdapter(m.ref);
+    report();
+  }
+
+  // Browsers refuse to start sound without a tap. First our own button asks
+  // for one; if the browser wants the tap inside the embedded player itself
+  // (iOS does), the button gives way and a hint points at the player.
+  function showUnlock() {
+    unlockBtn.style.display = blocked && cur && !tapPlayer ? 'flex' : 'none';
+    hint.style.display = blocked && cur && tapPlayer ? 'block' : 'none';
+  }
+
+  function report() {
+    if (!cur) { send({ ev: 'state', kind: null, st: 'idle', t: 0, d: 0, blocked: false }); return; }
+    var st = cur.state();
+    if (wantPlaying && st === 'paused') {
+      // A short pause is normal (a seek, a restart); only a lasting one
+      // means the browser is holding playback back.
+      if (!pausedSince) pausedSince = Date.now();
+      var waited = Date.now() - pausedSince;
+      if ((cur.denied && cur.denied()) || waited > (unlockTried ? 2000 : 3000)) {
+        if (!blocked && unlockTried && !cur.needsButton && !tapPlayer) {
+          tapPlayer = true;
+          if (cur.nativeControls) cur.nativeControls();
+        }
+        blocked = true;
+      }
+    } else {
+      pausedSince = 0;
+      if (st !== 'buffering' || !wantPlaying) blocked = false;
+    }
+    showUnlock();
+    send({
+      ev: 'state', kind: kind, st: st, t: cur.time(), d: cur.duration(), blocked: blocked,
+      title: cur.title ? cur.title() : null
+    });
+  }
+
+  function handle(m) {
+    if (!m || !m.cmd) return;
+    switch (m.cmd) {
+      case 'load': load(m); return;
+      case 'stop': unload(); report(); return;
+      case 'play':
+        wantPlaying = true;
+        if (cur) cur.play();
+        break;
+      case 'pause':
+        wantPlaying = false;
+        if (cur) cur.pause();
+        break;
+      case 'seek':
+        if (cur) cur.seek(Number(m.t) || 0);
+        break;
+    }
+    report();
+  }
+
+  unlockBtn.addEventListener('click', function () {
+    if (!cur) return;
+    unlockTried = true;
+    blocked = false;
+    wantPlaying = true;
+    pausedSince = Date.now();
+    cur.play();
+    showUnlock();
+    setTimeout(report, 150);
+  });
+
+  window.addEventListener('message', function (e) {
+    if (e.source !== window.parent || window.parent === window) return;
+    var m;
+    try { m = typeof e.data === 'string' ? JSON.parse(e.data) : null; } catch (_) { return; }
+    if (m && m.kc === 1) handle(m);
+  });
+
+  // WebView entry point.
+  window.kcCommand = function (json) {
+    try { handle(JSON.parse(json)); } catch (e) {}
+  };
+
+  setInterval(report, 400);
+  send({ ev: 'ready' });
+})();
+</script>
+</body>
+</html>
