@@ -9,7 +9,8 @@ import '../services/search.dart';
 import '../theme.dart';
 import 'sources_screen.dart';
 
-/// Pick what to watch: paste a link or search through one of the sources.
+/// Pick what to watch: paste a link, or search — one query goes to every
+/// connected source and the answers come back as a single list.
 /// Pops with the chosen [VideoSource].
 class AddVideoSheet extends StatefulWidget {
   const AddVideoSheet({super.key});
@@ -22,10 +23,9 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
   final _link = TextEditingController();
   final _query = TextEditingController();
 
-  String? _sourceId;
   bool _searching = false;
   String? _error;
-  List<SearchResult>? _results;
+  CombinedResults? _found;
 
   SearchService get _search => ServicesScope.of(context).search;
 
@@ -35,12 +35,6 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
     _query.dispose();
     super.dispose();
   }
-
-  SearchSource _current(List<SearchSource> sources) => sources.firstWhere(
-    (s) => s.id == _sourceId,
-    orElse: () =>
-        sources.firstWhere((s) => s.usableHere, orElse: () => sources.first),
-  );
 
   Future<void> _paste() async {
     final data = await Clipboard.getData(Clipboard.kTextPlain);
@@ -62,25 +56,17 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
   Future<void> _runSearch() async {
     final query = _query.text.trim();
     if (query.isEmpty || _searching) return;
-    final source = _current(_search.sources);
     FocusScope.of(context).unfocus();
     setState(() {
       _searching = true;
       _error = null;
     });
-    try {
-      final results = await _search.search(source, query);
-      if (!mounted) return;
-      setState(() => _results = results);
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString();
-        _results = null;
-      });
-    } finally {
-      if (mounted) setState(() => _searching = false);
-    }
+    final found = await _search.searchAll(query);
+    if (!mounted) return;
+    setState(() {
+      _found = found;
+      _searching = false;
+    });
   }
 
   void _pick(SearchResult result) {
@@ -90,6 +76,11 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
       return;
     }
     Navigator.of(context).pop(source);
+  }
+
+  void _openSources() {
+    Navigator.of(context)
+        .push(MaterialPageRoute<void>(builder: (_) => const SourcesScreen()));
   }
 
   @override
@@ -108,7 +99,14 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
             listenable: _search,
             builder: (context, _) {
               final sources = _search.sources;
-              final current = _current(sources);
+              final active = [
+                for (final s in sources)
+                  if (s.usableHere) s.name,
+              ];
+              final idle = [
+                for (final s in sources)
+                  if (!s.usableHere) s.name,
+              ];
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -118,96 +116,14 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
                   ),
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 20),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: _link,
-                            keyboardType: TextInputType.url,
-                            autocorrect: false,
-                            decoration: InputDecoration(
-                              hintText: 'Ссылка на видео',
-                              suffixIcon: IconButton(
-                                tooltip: 'Вставить',
-                                icon: const Icon(Icons.content_paste_rounded),
-                                onPressed: _paste,
-                              ),
-                            ),
-                            onChanged: (_) => setState(() => _error = null),
-                            onSubmitted: (_) => _openLink(),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        FilledButton(
-                          onPressed: detected == null ? null : _openLink,
-                          child: const Text('Открыть'),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
-                    child: Text(
-                      detected == null
-                          ? 'YouTube, VK Видео, Rutube или прямая ссылка на '
-                                'файл (.mp4, .m3u8).'
-                          : detected.syncable
-                          ? '${detected.label} · будет идти у всех одновременно'
-                          : 'Обычная страница · откроется рядом с чатом, без '
-                                'синхронизации',
-                      style: text.bodySmall?.copyWith(
-                        color: detected == null || detected.syncable
-                            ? kTextDim
-                            : const Color(0xFFFFB74D),
-                      ),
-                    ),
-                  ),
-                  const Padding(
-                    padding: EdgeInsets.fromLTRB(20, 16, 20, 12),
-                    child: Divider(),
-                  ),
-                  SizedBox(
-                    height: 36,
-                    child: ListView(
-                      scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.symmetric(horizontal: 20),
-                      children: [
-                        for (final s in sources)
-                          Padding(
-                            padding: const EdgeInsets.only(right: 8),
-                            child: ChoiceChip(
-                              label: Text(s.name),
-                              selected: s.id == current.id,
-                              showCheckmark: false,
-                              onSelected: (_) => setState(() {
-                                _sourceId = s.id;
-                                _results = null;
-                                _error = null;
-                              }),
-                            ),
-                          ),
-                        ActionChip(
-                          avatar: const Icon(Icons.tune_rounded, size: 16),
-                          label: const Text('Источники'),
-                          onPressed: () => Navigator.of(context).push(
-                            MaterialPageRoute<void>(
-                              builder: (_) => const SourcesScreen(),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
                     child: TextField(
                       controller: _query,
-                      enabled: current.ready,
+                      enabled: active.isNotEmpty,
                       textInputAction: TextInputAction.search,
                       decoration: InputDecoration(
-                        hintText: current.ready
-                            ? 'Поиск в «${current.name}»'
-                            : 'Для «${current.name}» нужен ключ API',
+                        hintText: active.isEmpty
+                            ? 'Нет подключённых источников'
+                            : 'Название фильма или видео',
                         prefixIcon: const Icon(Icons.search_rounded),
                         suffixIcon: _searching
                             ? const Padding(
@@ -225,35 +141,35 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
                       onSubmitted: (_) => _runSearch(),
                     ),
                   ),
-                  if (!current.ready)
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 10, 20, 0),
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: TextButton.icon(
-                          icon: const Icon(Icons.key_rounded, size: 18),
-                          label: const Text('Указать ключ'),
-                          onPressed: () => Navigator.of(context).push(
-                            MaterialPageRoute<void>(
-                              builder: (_) => SourceEditScreen(source: current),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 6, 8, 0),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            [
+                              if (active.isNotEmpty)
+                                'Ищем в: ${active.join(', ')}',
+                              if (idle.isNotEmpty)
+                                'Не подключены: ${idle.join(', ')}',
+                            ].join('\n'),
+                            style: text.bodySmall?.copyWith(
+                              color: kTextDim,
+                              height: 1.4,
                             ),
                           ),
                         ),
-                      ),
+                        TextButton.icon(
+                          onPressed: _openSources,
+                          icon: const Icon(Icons.tune_rounded, size: 16),
+                          label: const Text('Источники'),
+                        ),
+                      ],
                     ),
-                  if (current.ready && !current.usableHere && _error == null)
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 10, 20, 0),
-                      child: Text(
-                        '«${current.name}» не отвечает на запросы из браузера. '
-                        'Поиск по нему работает в приложении для Android, а '
-                        'ссылку оттуда можно вставить выше.',
-                        style: text.bodySmall?.copyWith(color: kTextDim),
-                      ),
-                    ),
+                  ),
                   if (_error != null)
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+                      padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
                       child: Text(
                         _error!,
                         style: const TextStyle(
@@ -262,7 +178,21 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
                         ),
                       ),
                     ),
-                  Expanded(child: _buildResults()),
+                  Expanded(
+                    child: _found == null
+                        ? _LinkEntry(
+                            controller: _link,
+                            detected: detected,
+                            onChanged: () => setState(() => _error = null),
+                            onPaste: _paste,
+                            onOpen: _openLink,
+                          )
+                        : _Results(
+                            found: _found!,
+                            onPick: _pick,
+                            onBack: () => setState(() => _found = null),
+                          ),
+                  ),
                 ],
               );
             },
@@ -271,20 +201,158 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
       ),
     );
   }
+}
 
-  Widget _buildResults() {
-    final results = _results;
-    if (results == null) return const SizedBox.shrink();
-    if (results.isEmpty) {
-      return const Center(
-        child: Text('Ничего не нашлось', style: TextStyle(color: kTextDim)),
-      );
-    }
+/// Shown until a search is made: the field for a direct link.
+class _LinkEntry extends StatelessWidget {
+  const _LinkEntry({
+    required this.controller,
+    required this.detected,
+    required this.onChanged,
+    required this.onPaste,
+    required this.onOpen,
+  });
+
+  final TextEditingController controller;
+  final VideoSource? detected;
+  final VoidCallback onChanged;
+  final VoidCallback onPaste;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final detected = this.detected;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 16),
+      children: [
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 12),
+          child: Row(
+            children: [
+              Expanded(child: Divider()),
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                child: Text(
+                  'или по ссылке',
+                  style: TextStyle(color: kTextDim, fontSize: 12),
+                ),
+              ),
+              Expanded(child: Divider()),
+            ],
+          ),
+        ),
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: controller,
+                keyboardType: TextInputType.url,
+                autocorrect: false,
+                decoration: InputDecoration(
+                  hintText: 'Ссылка на видео',
+                  suffixIcon: IconButton(
+                    tooltip: 'Вставить',
+                    icon: const Icon(Icons.content_paste_rounded),
+                    onPressed: onPaste,
+                  ),
+                ),
+                onChanged: (_) => onChanged(),
+                onSubmitted: (_) => onOpen(),
+              ),
+            ),
+            const SizedBox(width: 10),
+            FilledButton(
+              onPressed: detected == null ? null : onOpen,
+              child: const Text('Открыть'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text(
+          detected == null
+              ? 'YouTube, VK Видео, Rutube или прямая ссылка на файл '
+                    '(.mp4, .m3u8).'
+              : detected.syncable
+              ? '${detected.label} · будет идти у всех одновременно'
+              : 'Обычная страница · откроется рядом с чатом, без '
+                    'синхронизации',
+          style: text.bodySmall?.copyWith(
+            color: detected == null || detected.syncable
+                ? kTextDim
+                : const Color(0xFFFFB74D),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _Results extends StatelessWidget {
+  const _Results({
+    required this.found,
+    required this.onPick,
+    required this.onBack,
+  });
+
+  final CombinedResults found;
+  final ValueChanged<SearchResult> onPick;
+  final VoidCallback onBack;
+
+  @override
+  Widget build(BuildContext context) {
+    final results = found.results;
+    final failures = found.failures;
+    // Say where each result came from only when there is a choice.
+    final showSource = found.searched.length > 1;
+
     return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(8, 8, 8, 16),
-      itemCount: results.length,
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 16),
+      itemCount: results.length + 1,
       itemBuilder: (context, i) {
-        final r = results[i];
+        if (i == 0) {
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 4, 4),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        results.isEmpty
+                            ? 'Ничего не нашлось'
+                            : 'Найдено: ${results.length}',
+                        style: const TextStyle(color: kTextDim, fontSize: 13),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: onBack,
+                      child: const Text('Вставить ссылку'),
+                    ),
+                  ],
+                ),
+                for (final f in failures.entries)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6, right: 8),
+                    child: Text(
+                      '${f.key}: ${f.value}',
+                      style: const TextStyle(
+                        color: Color(0xFFFFB74D),
+                        fontSize: 12.5,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          );
+        }
+        final r = results[i - 1];
+        final caption = [
+          if (showSource) r.source,
+          if (r.subtitle != null && r.subtitle!.isNotEmpty) r.subtitle!,
+        ].join(' · ');
         return ListTile(
           contentPadding: const EdgeInsets.symmetric(
             horizontal: 12,
@@ -296,34 +364,40 @@ class _AddVideoSheetState extends State<AddVideoSheet> {
               width: 96,
               height: 54,
               child: r.poster == null
-                  ? const ColoredBox(
-                      color: kSurfaceHigh,
-                      child: Icon(Icons.movie_outlined, color: kTextDim),
-                    )
+                  ? const _NoPoster()
                   : Image.network(
                       r.poster!,
                       fit: BoxFit.cover,
                       // Posters from servers without CORS still show on web.
                       webHtmlElementStrategy: WebHtmlElementStrategy.fallback,
-                      errorBuilder: (_, _, _) => const ColoredBox(
-                        color: kSurfaceHigh,
-                        child: Icon(Icons.movie_outlined, color: kTextDim),
-                      ),
+                      errorBuilder: (_, _, _) => const _NoPoster(),
                     ),
             ),
           ),
           title: Text(r.title, maxLines: 2, overflow: TextOverflow.ellipsis),
-          subtitle: r.subtitle == null
+          subtitle: caption.isEmpty
               ? null
               : Text(
-                  r.subtitle!,
+                  caption,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: kTextDim),
                 ),
-          onTap: () => _pick(r),
+          onTap: () => onPick(r),
         );
       },
+    );
+  }
+}
+
+class _NoPoster extends StatelessWidget {
+  const _NoPoster();
+
+  @override
+  Widget build(BuildContext context) {
+    return const ColoredBox(
+      color: kSurfaceHigh,
+      child: Icon(Icons.movie_outlined, color: kTextDim),
     );
   }
 }

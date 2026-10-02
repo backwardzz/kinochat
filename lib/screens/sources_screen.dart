@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 
 import '../main.dart';
 import '../models.dart';
+import '../services/detect.dart';
 import '../services/link_parser.dart';
 import '../services/search.dart';
 import '../theme.dart';
@@ -21,7 +22,7 @@ class SourcesScreen extends StatelessWidget {
           MaterialPageRoute<void>(builder: (_) => const SourceEditScreen()),
         ),
         icon: const Icon(Icons.add_rounded),
-        label: const Text('Свой API'),
+        label: const Text('Добавить API'),
       ),
       body: SafeArea(
         child: Center(
@@ -37,8 +38,8 @@ class SourcesScreen extends StatelessWidget {
                     const Padding(
                       padding: EdgeInsets.fromLTRB(4, 0, 4, 12),
                       child: Text(
-                        'Через источник приложение ищет видео по названию. '
-                        'Можно подключить любой API, который отвечает в JSON.',
+                        'Поиск идёт сразу по всем источникам из этого списка. '
+                        'Добавить можно любой API, который отвечает в JSON.',
                         style: TextStyle(color: kTextDim, height: 1.4),
                       ),
                     ),
@@ -73,7 +74,7 @@ class _SourceTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final String status;
     if (!source.ready) {
-      status = 'Нужен ключ API';
+      status = 'Не участвует в поиске: нужен ключ API';
     } else if (kIsWeb && source.webBlocked) {
       status = 'Работает в приложении для Android, в браузере — нет';
     } else {
@@ -82,7 +83,7 @@ class _SourceTile extends StatelessWidget {
     return ListTile(
       leading: Icon(
         source.builtIn ? Icons.verified_outlined : Icons.api_rounded,
-        color: source.ready ? null : const Color(0xFFFFB74D),
+        color: source.usableHere ? null : const Color(0xFFFFB74D),
       ),
       title: Text(source.name),
       subtitle: Text(status, style: const TextStyle(color: kTextDim)),
@@ -97,6 +98,10 @@ class _SourceTile extends StatelessWidget {
 }
 
 /// Add or edit a source. For built-in ones only the key can be changed.
+///
+/// A new API needs just its address: where the title, the link and the
+/// poster are in the answer is worked out from a trial search. The paths can
+/// still be corrected by hand under «Дополнительно».
 class SourceEditScreen extends StatefulWidget {
   const SourceEditScreen({super.key, this.source});
 
@@ -128,9 +133,9 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
   );
   final _testQuery = TextEditingController(text: 'кино');
 
-  bool _testing = false;
-  String? _testOutcome;
-  bool _testOk = false;
+  bool _busy = false;
+  String? _outcome;
+  bool _ok = false;
 
   bool get _builtIn => _initial?.builtIn ?? false;
 
@@ -166,15 +171,26 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
     return out;
   }
 
+  /// `…?q=` pasted without the placeholder gets one.
+  String _address() {
+    final url = _url.text.trim();
+    return !url.contains('{query}') && url.endsWith('=') ? '$url{query}' : url;
+  }
+
   SearchSource _build() {
     final initial = _initial;
     if (initial != null && initial.builtIn) {
       return initial.copyWith(apiKey: _key.text.trim());
     }
+    final address = _address();
+    final name = _name.text.trim();
     return SearchSource(
       id: initial?.id ?? newId(),
-      name: _name.text.trim().isEmpty ? 'Мой источник' : _name.text.trim(),
-      urlTemplate: _url.text.trim(),
+      name: name.isNotEmpty
+          ? name
+          : (Uri.tryParse(address)?.host.replaceFirst('www.', '') ?? '')
+                .ifEmpty('Мой источник'),
+      urlTemplate: address,
       apiKey: _key.text.trim(),
       headers: _parseHeaders(),
       listPath: _list.text.trim(),
@@ -186,80 +202,116 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
     );
   }
 
-  String? _validate(SearchSource s) {
+  String? _problemWith(SearchSource s) {
     if (s.builtIn) return null;
     if (!s.urlTemplate.startsWith('http')) {
       return 'Укажите адрес API, он начинается с https://';
     }
     if (!s.urlTemplate.contains('{query}')) {
-      return 'В адресе должно быть {query} — туда подставится текст поиска.';
+      return 'Поставьте в адресе {query} там, где должен быть текст поиска. '
+          'Например: https://site.com/api/search?q={query}';
     }
-    if (s.linkPath.isEmpty) return 'Укажите поле со ссылкой на видео.';
+    if (s.needsKey && s.apiKey.isEmpty) {
+      return 'В адресе есть {key} — укажите ключ API.';
+    }
     return null;
   }
 
-  Future<void> _test() async {
-    final source = _build();
-    final problem = _validate(source);
-    if (problem != null) {
-      setState(() {
-        _testOk = false;
-        _testOutcome = problem;
-      });
-      return;
-    }
+  void _show(String text, {bool ok = false}) {
+    if (!mounted) return;
     setState(() {
-      _testing = true;
-      _testOutcome = null;
+      _outcome = text;
+      _ok = ok;
+    });
+  }
+
+  /// Runs a trial search, works out the fields if they are not set yet and
+  /// reports what was found. Returns whether the source is usable.
+  Future<bool> _check() async {
+    var source = _build();
+    final problem = _problemWith(source);
+    if (problem != null) {
+      _show(problem);
+      return false;
+    }
+    final query = _testQuery.text.trim().ifEmpty('кино');
+    final search = ServicesScope.of(context).search;
+    setState(() {
+      _busy = true;
+      _outcome = null;
     });
     try {
-      final results = await ServicesScope.of(context).search
-          .search(source, _testQuery.text.trim());
-      if (!mounted) return;
-      if (results.isEmpty) {
-        setState(() {
-          _testOk = false;
-          _testOutcome = 'Запрос прошёл, но результатов нет. Проверьте поля.';
-        });
-      } else {
-        final first = results.first;
-        final parsed = parseVideoLink(first.link);
-        final kind = parsed == null
-            ? 'не ссылка — проверьте поле ссылки'
-            : parsed.syncable
-            ? '${parsed.label}, синхронизация будет работать'
-            : 'обычная страница, откроется без синхронизации';
-        setState(() {
-          _testOk = parsed != null;
-          _testOutcome =
-              'Найдено: ${results.length}\n'
-              'Первый результат: ${first.title}\n'
-              '${first.link}\n'
-              'Вид ссылки: $kind';
-        });
+      final json = await search.fetch(source, query);
+      if (!mounted) return false;
+
+      if (!source.builtIn && source.linkPath.isEmpty) {
+        final found = detectPaths(json);
+        if (found == null) {
+          _show(
+            'Сервис ответил, но ссылок на видео в ответе не нашлось. '
+            'Попробуйте другой запрос для проверки или укажите поля вручную '
+            'в «Дополнительно».',
+          );
+          return false;
+        }
+        _list.text = found.listPath;
+        _title.text = found.titlePath;
+        _link.text = found.linkPath;
+        _poster.text = found.posterPath;
+        _subtitle.text = found.subtitlePath;
+        source = _build();
       }
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _testOk = false;
-        _testOutcome = e.toString();
-      });
+
+      final results = parseResults(source, json);
+      if (results.isEmpty) {
+        _show(
+          'Сервис ответил, но по запросу «$query» ничего нет. '
+          'Попробуйте другой запрос для проверки.',
+        );
+        return false;
+      }
+      final first = results.first;
+      final parsed = parseVideoLink(first.link);
+      if (parsed == null) {
+        _show(
+          'В поле ссылки оказалась не ссылка: ${first.link}\n'
+          'Поправьте поля в «Дополнительно».',
+        );
+        return false;
+      }
+      _show(
+        'Работает, найдено: ${results.length}\n'
+        '${first.title}\n'
+        '${parsed.syncable ? '${parsed.label} — будет идти у всех одновременно' : 'Обычная страница — откроется без синхронизации'}',
+        ok: true,
+      );
+      return true;
+    } on SearchException catch (e) {
+      _show(e.message);
+      return false;
     } finally {
-      if (mounted) setState(() => _testing = false);
+      if (mounted) setState(() => _busy = false);
     }
   }
 
+  Future<void> _redetect() async {
+    for (final c in [_list, _title, _link, _linkTemplate, _poster, _subtitle]) {
+      c.clear();
+    }
+    await _check();
+  }
+
   Future<void> _save() async {
+    final search = ServicesScope.of(context).search;
+    // A source without fields is not usable yet: check it first.
+    if (!_builtIn && _link.text.trim().isEmpty && !await _check()) return;
     final source = _build();
-    final problem = _validate(source);
+    final problem = _problemWith(source);
     if (problem != null) {
-      setState(() {
-        _testOk = false;
-        _testOutcome = problem;
-      });
+      _show(problem);
       return;
     }
-    await ServicesScope.of(context).search.save(source);
+    await search.save(source);
     if (mounted) Navigator.of(context).pop();
   }
 
@@ -295,7 +347,7 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
       appBar: AppBar(
         title: Text(
           initial == null
-              ? 'Свой API'
+              ? 'Новый API'
               : _builtIn
               ? initial.name
               : 'Источник',
@@ -330,70 +382,23 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
                   ] else
                     const _Note('Ключ не нужен, источник готов к работе.'),
                 ] else ...[
-                  _field(_name, 'Название', hint: 'Например: Мой каталог'),
                   _field(
                     _url,
                     'Адрес поиска',
-                    hint: 'https://example.com/api/search?q={query}&key={key}',
+                    hint: 'https://site.com/api/search?q={query}',
                     help:
-                        '{query} — текст поиска, {key} — ключ из поля ниже '
-                        '(если он нужен).',
+                        '{query} — место для текста поиска. Если нужен ключ, '
+                        'поставьте в адресе {key} и впишите ключ ниже.',
                     mono: true,
-                    lines: 2,
+                    lines: 3,
                   ),
                   _field(_key, 'Ключ API (если нужен)', mono: true),
                   _field(
-                    _headers,
-                    'Заголовки (если нужны)',
-                    hint: 'Authorization: Bearer {key}',
-                    help: 'По одному на строку: Имя: значение.',
-                    mono: true,
-                    lines: 2,
+                    _name,
+                    'Название (не обязательно)',
+                    hint: 'Например: Мой каталог',
                   ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Где в ответе искать данные',
-                    style: Theme.of(context).textTheme.titleSmall,
-                  ),
-                  const SizedBox(height: 4),
-                  const Text(
-                    'Путь — названия полей через точку, например '
-                    'data.items или snippet.title. Число — номер элемента '
-                    'в списке (0 — первый, -1 — последний).',
-                    style: TextStyle(
-                      color: kTextDim,
-                      fontSize: 13,
-                      height: 1.4,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  _field(
-                    _list,
-                    'Список результатов',
-                    hint: 'results',
-                    help: 'Пусто, если ответ — сразу список.',
-                    mono: true,
-                  ),
-                  _field(_title, 'Название', hint: 'title', mono: true),
-                  _field(
-                    _link,
-                    'Ссылка на видео',
-                    hint: 'video_url',
-                    help:
-                        'Прямая ссылка на файл либо ссылка YouTube, VK Видео '
-                        'или Rutube — тогда будет синхронизация.',
-                    mono: true,
-                  ),
-                  _field(
-                    _linkTemplate,
-                    'Шаблон ссылки (если в поле только id)',
-                    hint: 'https://example.com/video/{value}.mp4',
-                    mono: true,
-                  ),
-                  _field(_poster, 'Постер', hint: 'poster.url', mono: true),
-                  _field(_subtitle, 'Подпись', hint: 'year', mono: true),
                 ],
-                const SizedBox(height: 8),
                 Row(
                   children: [
                     Expanded(
@@ -407,8 +412,8 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
                     ),
                     const SizedBox(width: 10),
                     OutlinedButton(
-                      onPressed: _testing ? null : _test,
-                      child: _testing
+                      onPressed: _busy ? null : _check,
+                      child: _busy
                           ? const SizedBox(
                               width: 18,
                               height: 18,
@@ -418,7 +423,7 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
                     ),
                   ],
                 ),
-                if (_testOutcome != null)
+                if (_outcome != null)
                   Padding(
                     padding: const EdgeInsets.only(top: 12),
                     child: Container(
@@ -427,23 +432,96 @@ class _SourceEditScreenState extends State<SourceEditScreen> {
                         color: kSurface,
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(
-                          color: _testOk
+                          color: _ok
                               ? const Color(0xFF66BB6A)
                               : const Color(0xFFFFB74D),
                         ),
                       ),
-                      child: SelectableText(
-                        _testOutcome!,
+                      child: Text(
+                        _outcome!,
                         style: const TextStyle(fontSize: 13, height: 1.45),
                       ),
                     ),
                   ),
-                const SizedBox(height: 20),
-                FilledButton(onPressed: _save, child: const Text('Сохранить')),
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: _busy ? null : _save,
+                  child: const Text('Сохранить'),
+                ),
+                if (!_builtIn) ...[const SizedBox(height: 12), _advanced()],
               ],
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  /// Manual control over what detection fills in.
+  Widget _advanced() {
+    return Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: EdgeInsets.zero,
+        expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+        title: const Text('Дополнительно', style: TextStyle(fontSize: 14)),
+        subtitle: const Text(
+          'Поля ответа и заголовки. Заполняются сами при проверке.',
+          style: TextStyle(color: kTextDim, fontSize: 12),
+        ),
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 4, bottom: 12),
+            child: Text(
+              'Путь — названия полей через точку, например data.items или '
+              'snippet.title. Число — номер элемента в списке (0 — первый, '
+              '-1 — последний).',
+              style: TextStyle(color: kTextDim, fontSize: 13, height: 1.4),
+            ),
+          ),
+          _field(
+            _list,
+            'Список результатов',
+            hint: 'results',
+            help: 'Пусто, если ответ — сразу список.',
+            mono: true,
+          ),
+          _field(_title, 'Название', hint: 'title', mono: true),
+          _field(
+            _link,
+            'Ссылка на видео',
+            hint: 'video_url',
+            help:
+                'Прямая ссылка на файл либо ссылка YouTube, VK Видео или '
+                'Rutube — тогда будет синхронизация.',
+            mono: true,
+          ),
+          _field(
+            _linkTemplate,
+            'Шаблон ссылки (если в поле только id)',
+            hint: 'https://site.com/video/{value}.mp4',
+            mono: true,
+          ),
+          _field(_poster, 'Постер', hint: 'poster.url', mono: true),
+          _field(_subtitle, 'Подпись', hint: 'year', mono: true),
+          _field(
+            _headers,
+            'Заголовки запроса',
+            hint: 'Authorization: Bearer {key}',
+            help: 'По одному на строку: Имя: значение.',
+            mono: true,
+            lines: 3,
+          ),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: _busy ? null : _redetect,
+              icon: const Icon(Icons.auto_fix_high_rounded, size: 18),
+              label: const Text('Определить поля заново'),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -502,4 +580,8 @@ class _Note extends StatelessWidget {
       child: Text(text, style: const TextStyle(color: kTextDim, height: 1.4)),
     );
   }
+}
+
+extension on String {
+  String ifEmpty(String fallback) => isEmpty ? fallback : this;
 }

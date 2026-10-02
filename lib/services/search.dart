@@ -128,12 +128,34 @@ class SearchResult {
     required this.link,
     this.poster,
     this.subtitle,
+    this.source = '',
   });
 
   final String title;
   final String link;
   final String? poster;
   final String? subtitle;
+
+  /// Name of the source that returned it.
+  final String source;
+}
+
+/// What one search over every source brought back.
+class CombinedResults {
+  const CombinedResults({
+    required this.results,
+    required this.searched,
+    required this.failures,
+  });
+
+  /// Results of all sources, taken in turn so that none is buried.
+  final List<SearchResult> results;
+
+  /// Names of the sources that were asked.
+  final List<String> searched;
+
+  /// Source name → why it gave nothing.
+  final Map<String, String> failures;
 }
 
 class SearchException implements Exception {
@@ -258,7 +280,31 @@ class SearchService extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<List<SearchResult>> search(SearchSource source, String query) async {
+  Future<List<SearchResult>> search(SearchSource source, String query) async =>
+      parseResults(source, await fetch(source, query));
+
+  /// Asks every source that can be used here, all at once.
+  Future<CombinedResults> searchAll(String query) async {
+    final usable = sources.where((s) => s.usableHere).toList();
+    final failures = <String, String>{};
+    final lists = await Future.wait([
+      for (final s in usable)
+        search(s, query).catchError((Object e) {
+          failures[s.name] = e is SearchException
+              ? e.message
+              : 'Не удалось разобрать ответ.';
+          return const <SearchResult>[];
+        }),
+    ]);
+    return CombinedResults(
+      results: interleave(lists),
+      searched: [for (final s in usable) s.name],
+      failures: failures,
+    );
+  }
+
+  /// The decoded JSON answer of [source] for [query].
+  Future<dynamic> fetch(SearchSource source, String query) async {
     if (!source.ready) {
       throw SearchException('Для «${source.name}» нужен ключ API.');
     }
@@ -301,14 +347,24 @@ class SearchService extends ChangeNotifier {
       });
     }
 
-    final dynamic json;
     try {
-      json = jsonDecode(utf8.decode(response.bodyBytes));
+      return jsonDecode(utf8.decode(response.bodyBytes));
     } catch (_) {
       throw SearchException('Ответ сервиса — не JSON.');
     }
-    return parseResults(source, json);
   }
+}
+
+/// Merges lists by taking one item from each in turn.
+List<T> interleave<T>(List<List<T>> lists) {
+  final out = <T>[];
+  final longest = lists.fold<int>(0, (m, l) => l.length > m ? l.length : m);
+  for (var i = 0; i < longest; i++) {
+    for (final list in lists) {
+      if (i < list.length) out.add(list[i]);
+    }
+  }
+  return out;
 }
 
 /// Pulls results out of an API answer according to the paths of [source].
@@ -326,12 +382,15 @@ List<SearchResult> parseResults(SearchSource source, dynamic json) {
     final value = readPath(item, source.linkPath)?.toString();
     if (value == null || value.isEmpty) continue;
     final link = source.linkTemplate.isEmpty
-        ? value
+        ? _withScheme(value)
         : source.linkTemplate.replaceAll('{value}', value);
-    final title = readPath(item, source.titlePath)?.toString();
-    final poster = source.posterPath.isEmpty
+    final title = source.titlePath.isEmpty
+        ? null
+        : readPath(item, source.titlePath)?.toString();
+    final rawPoster = source.posterPath.isEmpty
         ? null
         : readPath(item, source.posterPath)?.toString();
+    final poster = rawPoster == null ? null : _withScheme(rawPoster);
     final subtitle = source.subtitlePath.isEmpty
         ? null
         : readPath(item, source.subtitlePath)?.toString();
@@ -341,11 +400,15 @@ List<SearchResult> parseResults(SearchSource source, dynamic json) {
         link: link,
         poster: (poster != null && poster.startsWith('http')) ? poster : null,
         subtitle: subtitle == null ? null : _unescape(subtitle),
+        source: source.name,
       ),
     );
   }
   return out;
 }
+
+/// `//host/path` is a link without a scheme; such links mean https.
+String _withScheme(String url) => url.startsWith('//') ? 'https:$url' : url;
 
 /// Walks `a.b.0.c` through maps and lists. A negative number counts from the
 /// end of a list. An empty path returns [json] itself.
